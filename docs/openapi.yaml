@@ -1,0 +1,72 @@
+openapi: 3.0.3
+info:
+  title: Crawler Microservice API (crawld)
+  description: High-throughput, polite, restart-safe web crawler service.
+  version: 1.0.0
+paths:
+  /v1/crawl:
+    post:
+      summary: Execute bounded crawl
+      operationId: startCrawl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seeds:
+                  type: array
+                  items:
+                    type: string
+                sitemaps:
+                  type: array
+                  items:
+                    type: string
+                depth:
+                  type: string
+                  example: standard
+                follow_links:
+                  type: boolean
+                max_pages:
+                  type: integer
+                max_bytes:
+                  type: integer
+                max_duration:
+                  type: string
+                  example: 5m
+      responses:
+        '200':
+          description: Crawl finished successfully
+        '400':
+          description: Invalid request parameters
+  /v1/fetch:
+    post:
+      summary: Fetch single URL politely
+      operationId: fetchOne
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+      responses:
+        '200':
+          description: Document fetched
+  /v1/documents/{id}:
+    get:
+      summary: Get document by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document returned
+        '404':
+          description: Document not found
