@@ -84,6 +84,7 @@ func Handler(fn any) http.Handler {
 	default:
 		panic(fmt.Sprintf("httpx.Handler: unsupported handler type %T", fn))
 	}
+	return nil
 }
 
 func MethodNotAllowedHandler(allowed string) http.Handler {
