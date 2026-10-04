@@ -21,10 +21,17 @@ func Postgres(t testing.TB) *pgxpool.Pool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	schemaName := fmt.Sprintf("test_schema_%d_%d", time.Now().UnixNano(), os.Getpid())
+
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
 	}
+
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schemaName + ", public"
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -35,9 +42,7 @@ func Postgres(t testing.TB) *pgxpool.Pool {
 		t.Fatalf("ping TEST_DATABASE_URL: %v", err)
 	}
 
-	schemaName := fmt.Sprintf("test_schema_%d", time.Now().UnixNano())
-	_, err = pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s; SET search_path TO %s, public;", schemaName, schemaName))
-	if err != nil {
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s;", schemaName)); err != nil {
 		t.Fatalf("create test schema: %v", err)
 	}
 
