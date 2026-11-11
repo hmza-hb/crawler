@@ -177,8 +177,10 @@ func (f *PostgresFrontier) claimWithHostLimits(ctx context.Context, n int, lease
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, err
 	}
+	rows.Close()
 	if len(ids) == 0 {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
@@ -294,7 +296,7 @@ func (f *PostgresFrontier) Complete(ctx context.Context, items []Item, err error
 			UPDATE crawler_frontier
 			SET failures     = failures + 1,
 			    leased_until = NULL,
-			    ready_at     = $3 + make_interval(secs => LEAST(300, (failures + 1) * 2)),
+			    ready_at     = $3::timestamptz + (LEAST(300, (failures + 1) * 2) * interval '1 second'),
 			    last_error   = $4,
 			    state        = CASE WHEN failures + 1 >= 3 THEN 'failed' ELSE state END
 			WHERE run_id = $1 AND dedupe_key = $2`,
