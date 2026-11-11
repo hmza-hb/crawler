@@ -58,6 +58,9 @@ func run() error {
 	}
 	log := logging.New(cfg.Log.Level, cfg.Log.Format, os.Stdout)
 	log.Info("starting crawld", "version", version, "addr", cfg.HTTP.Addr)
+	if cfg.HTTP.APIKey == "" {
+		log.Warn("CRAWLD_API_KEY is unset; /v1 routes are not authenticated (set a key before exposing crawld beyond loopback)")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -146,7 +149,31 @@ func run() error {
 	mux.Handle("GET /v1/hosts/{host}/robots", httpx.Handler(api.hostRobots))
 	mux.Handle("/v1/stats", httpx.Handler(api.stats))
 
-	return srv.Run(ctx, mux)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := pool.Ping(r.Context()); err != nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]any{"error": "database unavailable"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /version", func(w http.ResponseWriter, _ *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]any{"version": version})
+	})
+
+	handler := http.Handler(mux)
+	if cfg.HTTP.APIKey != "" {
+		handler = httpx.BearerAuth(cfg.HTTP.APIKey,
+			"/healthz", "/readyz", "/version", "/metrics",
+		)(handler)
+	}
+	handler = httpx.Recover(log)(handler)
+
+	return srv.Run(ctx, handler)
 }
 
 // api holds the handler dependencies. It is a struct rather than a set of

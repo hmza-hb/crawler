@@ -10,7 +10,8 @@ type LogConfig struct {
 }
 
 type HTTPConfig struct {
-	Addr string
+	Addr   string
+	APIKey string
 }
 
 type Config struct {
@@ -32,7 +33,12 @@ func Load() (*Config, error) {
 
 	httpAddr := os.Getenv("HTTP_ADDR")
 	if httpAddr == "" {
-		httpAddr = ":8080"
+		httpAddr = "127.0.0.1:8080"
+	}
+
+	apiKey := os.Getenv("CRAWLD_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("HTTP_API_KEY")
 	}
 
 	dbURL := os.Getenv("DATABASE_URL")
@@ -46,7 +52,8 @@ func Load() (*Config, error) {
 			Format: logFormat,
 		},
 		HTTP: HTTPConfig{
-			Addr: httpAddr,
+			Addr:   httpAddr,
+			APIKey: apiKey,
 		},
 		Database: dbURL,
 	}, nil
