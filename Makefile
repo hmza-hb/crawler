@@ -1,4 +1,4 @@
-.PHONY: all build test test-coverage lint clean docker-build docker-up docker-down
+.PHONY: all build test test-coverage lint vuln bench fuzz clean docker-build docker-up docker-down
 
 APP_NAME := crawld
 BUILD_DIR := bin
@@ -20,6 +20,16 @@ test-coverage:
 lint:
 	@which golangci-lint > /dev/null || (echo "golangci-lint not installed" && exit 0)
 	golangci-lint run ./...
+
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+bench:
+	go test -bench=. -benchmem -count=5 ./...
+
+fuzz:
+	go test -fuzz=FuzzNormalizeURL -fuzztime=30s .
+	go test -fuzz=FuzzParse -fuzztime=30s ./robotstxt/...
 
 clean:
 	rm -rf $(BUILD_DIR) coverage.out coverage.html
