@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"golang.org/x/net/idna"
@@ -23,7 +24,7 @@ func isPrivateHost(host string) bool {
 	if strings.EqualFold(h, "localhost") || strings.HasSuffix(strings.ToLower(h), ".localhost") {
 		return true
 	}
-	ip := net.ParseIP(h)
+	ip := hostIP(h)
 	if ip == nil {
 		// A name that is not an IP literal could still resolve to a private
 		// address. The transport re-checks after DNS resolution; this is the
@@ -33,7 +34,30 @@ func isPrivateHost(host string) bool {
 	return isPrivateIP(ip)
 }
 
+// hostIP parses an IP host literal, including decimal integer encodings some
+// stacks accept as hostnames (e.g. http://2130706433/ for 127.0.0.1).
+func hostIP(host string) net.IP {
+	h := strings.Trim(host, "[]")
+	if ip := net.ParseIP(h); ip != nil {
+		return ip
+	}
+	if strings.ContainsAny(h, ".:") {
+		return nil
+	}
+	if n, err := strconv.ParseUint(h, 10, 32); err == nil {
+		return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+	}
+	return nil
+}
+
 func isPrivateIP(ip net.IP) bool {
+	ip = ip.To16()
+	if ip == nil {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() {

@@ -173,24 +173,44 @@ func NewHTTPClient(cfg Config) *http.Client {
 	}
 }
 
-// safeDialContext re-checks the resolved address, because a public hostname can
-// resolve to 127.0.0.1 and the URL check alone would not catch it.
+// safeDialContext resolves the hostname once, rejects private targets, then dials
+// the chosen IP literal. The standard dial path would resolve again at connect
+// time, which allows DNS rebinding between check and connect.
 func safeDialContext(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
+		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
+		}
+		if ip := hostIP(host); ip != nil {
+			if isPrivateIP(ip) {
+				return nil, fmt.Errorf("crawler: refusing to dial %s: %s is private or unroutable", addr, ip)
+			}
+			return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 		}
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, err
 		}
-		for _, ip := range ips {
-			if isPrivateIP(ip.IP) {
-				return nil, fmt.Errorf("crawler: refusing to dial %s: %s resolves to a private address", addr, ip.IP)
-			}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("crawler: no addresses for %q", host)
 		}
-		return dial(ctx, network, addr)
+		var lastErr error
+		for _, ipa := range ips {
+			if isPrivateIP(ipa.IP) {
+				return nil, fmt.Errorf("crawler: refusing to dial %s: %s is private or unroutable", addr, ipa.IP)
+			}
+			target := net.JoinHostPort(ipa.IP.String(), port)
+			conn, dialErr := dial(ctx, network, target)
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("crawler: could not dial %q", addr)
 	}
 }
 

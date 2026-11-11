@@ -88,6 +88,12 @@ func TestPublicURLRejectsUnsafeTargets(t *testing.T) {
 		"http://0.0.0.0/",
 		// CGNAT range: routable-looking, not publicly reachable.
 		"http://100.64.0.1/",
+		"http://[fc00::1]/",
+		"http://[fe80::1]/",
+		"http://[::ffff:10.0.0.1]/",
+		// Decimal encoding of 127.0.0.1 — a classic SSRF bypass.
+		"http://2130706433/",
+		"http://2852039166/", // 169.254.169.254
 	}
 	for _, raw := range bad {
 		if u, err := PublicURL(raw); err == nil {
