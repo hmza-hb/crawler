@@ -36,6 +36,7 @@ import (
 	"github.com/hmza-hb/crawler/internal/platform/logging"
 	"github.com/hmza-hb/crawler/internal/platform/observe"
 	"github.com/hmza-hb/crawler/internal/platform/ratelimit"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const version = "0.1.0"
@@ -56,11 +57,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if err := config.ValidateHTTP(cfg.HTTP); err != nil {
+		return err
+	}
 	log := logging.New(cfg.Log.Level, cfg.Log.Format, os.Stdout)
 	log.Info("starting crawld", "version", version, "addr", cfg.HTTP.Addr)
-	if cfg.HTTP.APIKey == "" {
-		log.Warn("CRAWLD_API_KEY is unset; /v1 routes are not authenticated (set a key before exposing crawld beyond loopback)")
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -105,6 +106,7 @@ func run() error {
 	metrics := crawler.NewMetrics(registry)
 	store := crawler.NewPostgresStore(pool)
 	frontier := crawler.NewPostgresFrontier(pool)
+	frontier.SetPerHostDelay(crawlCfg.PerHostDelay)
 	defer frontier.Close()
 
 	fetcher, err := crawler.NewHTTPFetcher(crawlCfg, crawler.Options{
@@ -164,6 +166,7 @@ func run() error {
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]any{"version": version})
 	})
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	handler := http.Handler(mux)
 	if cfg.HTTP.APIKey != "" {
@@ -516,10 +519,19 @@ func (a *api) stats(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, httpx.Internal("stats").WithCause(err))
 		return
 	}
+	failed := 0
+	if pf, ok := a.frontier.(*crawler.PostgresFrontier); ok {
+		failed, err = pf.FailedCount(r.Context(), runID)
+		if err != nil {
+			httpx.Error(w, httpx.Internal("frontier failed count").WithCause(err))
+			return
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"frontier_depth": depth,
-		"run_id":         runID,
-		"stats":          st,
+		"frontier_depth":   depth,
+		"frontier_failed":  failed,
+		"run_id":           runID,
+		"stats":            st,
 	})
 }
 
