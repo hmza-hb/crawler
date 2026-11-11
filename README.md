@@ -26,8 +26,8 @@ Writing a crawler that works on your laptop is a weekend project. Writing one th
 |---|---|---|
 | You run a second instance | Both fetch the same URLs | Workers lease rows with `FOR UPDATE SKIP LOCKED`; no double-claims, no lock waits |
 | A worker is OOM-killed mid-crawl | URLs stuck "in progress" forever | Every claim carries a lease; expired leases are reclaimed automatically |
-| 100 workers, one target site | You hammer the host and get banned | Token-bucket rate limiting per registrable domain, per process (set `CRAWLER_HOST_RATE` on each `crawld` instance; shared budgets need external coordination) |
-| A user submits `http://169.254.169.254/latest/meta-data` | You leak cloud credentials | DNS is resolved and checked against private ranges before any connection, and re-checked on every redirect hop |
+| 100 workers, one target site | You hammer the host and get banned | Per-process token bucket plus Postgres `host_limits` on `PgFrontier` (`CRAWLER_PER_HOST_DELAY`) so multiple `crawld` instances share one gap per registrable domain |
+| A user submits `http://169.254.169.254/latest/meta-data` | You leak cloud credentials | SSRF guard: no HTTP(S) proxy env, every resolved IP checked, connect uses pinned literals; redirect hops validated |
 | The same page is re-crawled daily | Full re-download, full re-write | Conditional GET (`ETag` / `Last-Modified`); a `304` skips the body and the write |
 | `robots.txt` is ambiguous or unreachable | Ignored, or parsed by regex | Purpose-built RFC 9309 parser with defined failure semantics |
 
@@ -112,25 +112,26 @@ stateDiagram-v2
 
 ### 2. Crash recovery by construction
 
-There is no recovery code path to get wrong. A claim is a lease with a deadline, and an expired lease is just a claimable row. Kill workers at random and the crawl continues; the queue never holds state that only a dead process knew about.
+There is no recovery code path to get wrong. A claim is a lease with a deadline, and an expired lease is just a claimable row.
 
-`TestChaosMultiWorkerFrontier` (CI with Postgres) runs several workers, randomly abandons leases without `Complete`, and asserts the frontier drains with every URL completed exactly once. Lease duration is derived from `FetchTimeout`, retries, and a one-minute buffer so in-flight fetches are not reclaimed under normal timings; there is no mid-fetch lease extension. Failures backoff and are **dropped after three failures** (removed from the frontier, not a dead-letter table).
+`TestChaosMultiWorkerFrontier` (with `TEST_DATABASE_URL`, including CI) enqueues many URLs, runs concurrent claimers that sometimes hold a lease until it expires without calling `Complete`, and asserts every URL is eventually completed and the active frontier drains. Lease duration is derived from `FetchTimeout`, retries, and a one-minute buffer; there is no mid-fetch lease extension. After repeated failures an item moves to terminal `failed` state (`last_error`, attempt count) and is exposed via `/v1/stats` as `frontier_failed`.
 
 ### 3. Politeness is enforced at the transport, not requested of the caller
 
 - **RFC 9309 parser** (`robotstxt/`): wildcards (`*`, `$`), longest-match precedence, group selection, and `Crawl-delay`.
 - **Defined failure semantics:** a `404` on `robots.txt` means no restrictions; an unreachable or erroring robots endpoint fails *closed*, so Hermes does not crawl a host whose rules it cannot read.
-- **Per-domain token bucket** (in-process), keyed on the registrable domain, so `a.example.com` and `b.example.com` share one budget within a single `crawld` or embedded crawler. Worker goroutines in that process do not multiply traffic to one site; running **multiple instances** without a shared limiter does. Distinct hosts still crawl in parallel.
+- **Per-domain token bucket** (in-process) plus **`host_limits` in Postgres** on `PgFrontier`: each claim advances `next_allowed_at` by `CRAWLER_PER_HOST_DELAY` for that URL's registrable domain, at most one queued row per domain per claim batch, so multiple `crawld` processes share one polite gap per site. `MemoryFrontier` keeps the in-process limiter only.
 
 ### 4. SSRF isolation
 
 If users can submit URLs, your crawler is a request proxy into your own network. Hermes closes that off at the network layer:
 
-1. Resolve DNS once, reject private/unroutable targets, then **dial the resolved IP literal** (no second resolver pass that could rebind).
-2. Reject loopback, RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`fe80::/10`), unique local (`fc00::/7`), CGNAT (`100.64.0.0/10`), unspecified (`0.0.0.0`), IPv4-mapped private addresses (`::ffff:10.0.0.1`), decimal IP encodings, and cloud metadata (`169.254.169.254`).
-3. Re-run the check on **every redirect hop**, so an open redirect on a public site cannot bounce you inward.
+1. **No proxy env:** `Transport.Proxy = nil` so `HTTP_PROXY` cannot steer requests elsewhere.
+2. Resolve DNS once; **every** returned address must pass the blocklist; then **dial IP literals** (no second resolve).
+3. Block loopback, RFC 1918, multicast, `255.255.255.255`, CGNAT, documentation/benchmark/reserved ranges (`192.0.0.0/24`, `198.18.0.0/15`, `240.0.0.0/4`, …), IPv6 ULA/link-local/multicast, zone IDs, decimal IPv4 literals, IPv4-mapped private addresses, and NAT64 (`64:ff9b::/96`) when the embedded IPv4 is blocked.
+4. **Redirect hops** to private hosts are refused (same-origin redirects on loopback are allowed only with `CRAWLER_ALLOW_PRIVATE_HOSTS` and unchanged host:port).
 
-`CRAWLER_ALLOW_PRIVATE_HOSTS=true` disables the guard for local development. Never set it in a deployment that accepts untrusted URLs.
+`CRAWLER_ALLOW_PRIVATE_HOSTS=true` allows dialing private targets for local dev; redirect rules still block cross-authority private hops.
 
 ### 5. Conditional re-validation
 
@@ -251,7 +252,7 @@ curl -X POST http://127.0.0.1:8080/v1/fetch \
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL DSN | required for `crawld` |
 | `HTTP_ADDR` | API listen address | `127.0.0.1:8080` |
-| `CRAWLD_API_KEY` / `HTTP_API_KEY` | Bearer token for `/v1/*` (optional; strongly recommended if not loopback-only) | unset |
+| `CRAWLD_API_KEY` / `HTTP_API_KEY` | Bearer token for `/v1/*`; **required** if `HTTP_ADDR` is not loopback | unset (ok on `127.0.0.1` / `localhost` / `::1` only) |
 | `CRAWLER_USER_AGENT` | Upstream `User-Agent` | `HermesCrawler/1.0 (+https://github.com/hmza-hb/crawler)` |
 | `CRAWLER_CONCURRENCY` | Worker goroutines per run | `10` |
 | `CRAWLER_PER_HOST_DELAY` | Minimum gap between requests to one domain | `250ms` |
@@ -265,10 +266,7 @@ curl -X POST http://127.0.0.1:8080/v1/fetch \
 
 - `GET /healthz` returns 200 when the process is alive.
 - `GET /readyz` pings PostgreSQL.
-- `GET /metrics` exposes:
-  - `crawler_fetch_duration_seconds`: histogram of fetch latency
-  - `crawler_fetched_documents_total`: counter by status code and outcome
-  - `crawler_frontier_depth`: gauge of pending URLs
+- `GET /metrics` serves the Prometheus text format (Go runtime and process metrics via `prometheus/client_golang`). **Does not require the API key**; bind to a trusted network or protect with your edge proxy. Application-specific `crawler_*` series in code are not yet registered on this endpoint.
 
 ---
 
@@ -303,7 +301,14 @@ make lint
 go test -bench=. -benchmem -count=5 ./...   # fetch throughput, URL normalization
 ```
 
-Benchmarks (Linux amd64, Go 1.23, `-bench=BenchmarkFetchPages -benchmem` on a local `httptest` server, 8-way concurrency, politeness disabled): on the order of **thousands of fetches/sec** limited by the test server; `BenchmarkNormalizeURL` is sub-microsecond. Conditional `304` responses skip body retention and store writes (see `fetch_test.go`).
+Benchmarks (`go test -bench=. -benchmem -count=5 ./...`, **linux/amd64**, **go1.27.0**, CPU **Intel(R) Core(TM) i7-7820HQ @ 2.90GHz**):
+
+| Benchmark | ns/op (approx.) | B/op | allocs/op |
+|---|---:|---:|---:|
+| `BenchmarkFetchPages` | 91–113k | ~9.3k | 107 |
+| `BenchmarkNormalizeURL` | 378–396 | 160 | 5 |
+
+`BenchmarkFetchPages` uses a local `httptest` server with politeness disabled. Conditional `304` responses skip body retention and store writes (`fetch_test.go`).
 
 See [CHANGELOG.md](CHANGELOG.md) and [examples/](examples/).
 

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Crawler Microservice API (crawld)
-  description: High-throughput, polite, restart-safe web crawler service. Bind to loopback by default; set CRAWLD_API_KEY when exposing /v1 routes.
+  description: High-throughput, polite, restart-safe web crawler service. Default bind is loopback; non-loopback listen requires CRAWLD_API_KEY. /metrics is unauthenticated — expose only on trusted networks.
   version: 1.0.0
 components:
   securitySchemes:

@@ -1,5 +1,3 @@
-//go:build ignore
-
 // Basic embeds the crawler against an in-memory frontier for a single-process crawl.
 package main
 

@@ -9,7 +9,8 @@ services:
       - "8080:8080"
     environment:
       - DATABASE_URL=postgres://crawler:crawler_secret@postgres:5432/crawler?sslmode=disable
-      - HTTP_ADDR=:8080
+      - HTTP_ADDR=0.0.0.0:8080
+      - CRAWLD_API_KEY=dev-compose-change-me
       - LOG_LEVEL=info
       - LOG_FORMAT=json
       - CRAWLER_ALLOW_PRIVATE_HOSTS=true
