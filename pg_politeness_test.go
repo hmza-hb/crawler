@@ -3,7 +3,6 @@ package crawler_test
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +13,7 @@ func TestPostgresFrontierSharedHostPoliteness(t *testing.T) {
 	pool := newPool(t)
 	frontier := crawler.NewPostgresFrontier(pool)
 	defer frontier.Close()
-	const delay = 80 * time.Millisecond
+	const delay = 100 * time.Millisecond
 	frontier.SetPerHostDelay(delay)
 
 	ctx := context.Background()
@@ -23,101 +22,53 @@ func TestPostgresFrontierSharedHostPoliteness(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const n = 12
-	items := make([]crawler.Item, 0, n)
-	for i := 0; i < n; i++ {
-		items = append(items, crawler.Item{
-			URL:    fmt.Sprintf("https://example.com/p/%d", i),
-			Key:    fmt.Sprintf("k%d", i),
-			RunID:  runID,
-			Priority: 1,
-		})
-	}
-	otherRun := fmt.Sprintf("%s-other", runID)
-	items = append(items, crawler.Item{
-		URL:   "https://other.test/x",
-		Key:   "other",
-		RunID: otherRun,
-	})
-
-	if _, err := frontier.Enqueue(ctx, items); err != nil {
+	if _, err := frontier.Enqueue(ctx, []crawler.Item{
+		{URL: "https://example.com/a", Key: "a", RunID: runID, Priority: 1},
+		{URL: "https://example.com/b", Key: "b", RunID: runID, Priority: 1},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	var (
-		mu       sync.Mutex
-		claimAt  []time.Time
-		otherAt  []time.Time
-		wg       sync.WaitGroup
-		workers  = 1 // gap timing is per-domain; multiple workers race host_limits
-		stop     = make(chan struct{})
-	)
+	now := time.Now().UTC()
+	frontier.SetClock(func() time.Time { return now })
 
-	worker := func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			batch, err := frontier.Claim(ctx, 2, time.Minute)
-			if err != nil {
-				t.Errorf("claim: %v", err)
-				return
-			}
-			if len(batch) == 0 {
-				depth, _ := frontier.Depth(ctx)
-				if depth == 0 {
-					return
-				}
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
-			now := time.Now()
-			for _, it := range batch {
-				mu.Lock()
-				if it.RunID == otherRun {
-					otherAt = append(otherAt, now)
-				} else {
-					claimAt = append(claimAt, now)
-				}
-				mu.Unlock()
-				_ = frontier.Complete(ctx, []crawler.Item{it}, nil)
-			}
-		}
+	first, err := frontier.Claim(ctx, 1, time.Minute)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim: err=%v n=%d", err, len(first))
+	}
+	if first[0].Key != "a" && first[0].Key != "b" {
+		t.Fatalf("first key = %q", first[0].Key)
+	}
+	if err := frontier.Complete(ctx, first, nil); err != nil {
+		t.Fatal(err)
 	}
 
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go worker()
+	// Same domain: blocked until delay elapses.
+	blocked, err := frontier.Claim(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("second claim before delay = %d, want 0", len(blocked))
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		close(stop)
-		t.Fatal("politeness test timed out")
+	now = now.Add(delay)
+	second, err := frontier.Claim(ctx, 1, time.Minute)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second claim after delay: err=%v n=%d", err, len(second))
+	}
+	if second[0].Key == first[0].Key {
+		t.Fatalf("got same key %q twice", second[0].Key)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(claimAt) < 3 {
-		t.Fatalf("claims = %d, want several for example.com", len(claimAt))
+	// Other registrable domain is independent of example.com's gate.
+	if _, err := frontier.Enqueue(ctx, []crawler.Item{
+		{URL: "https://other.test/x", Key: "other", RunID: runID + "-o", Priority: 1},
+	}); err != nil {
+		t.Fatal(err)
 	}
-	for i := 1; i < len(claimAt); i++ {
-		gap := claimAt[i].Sub(claimAt[i-1])
-		if gap < delay-time.Millisecond*15 {
-			t.Errorf("gap[%d] = %v, want >= %v (shared host_limits)", i, gap, delay)
-		}
-	}
-	if len(otherAt) == 0 {
-		t.Fatal("expected parallel claim on other.test")
+	other, err := frontier.Claim(ctx, 1, time.Minute)
+	if err != nil || len(other) != 1 || other[0].Key != "other" {
+		t.Fatalf("other domain claim: err=%v got=%+v", err, other)
 	}
 }

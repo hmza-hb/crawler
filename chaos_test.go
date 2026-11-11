@@ -109,8 +109,8 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 	}
 	wg.Wait()
 
-	if int(completed.Load()) != urlCount {
-		t.Errorf("completed = %d, want %d (at-least-once across reclaim)", completed.Load(), urlCount)
+	if n := int(completed.Load()); n < urlCount {
+		t.Errorf("completed = %d, want at least %d (reclaim may complete some URLs more than once)", n, urlCount)
 	}
 	depth, err := frontier.Depth(ctx)
 	if err != nil {
