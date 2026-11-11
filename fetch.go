@@ -21,6 +21,11 @@ import (
 	"github.com/hmza-hb/crawler/robotstxt"
 )
 
+// lookupIPAddr is swappable for tests (custom resolver behaviour).
+var lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
 // Fetcher retrieves one URL. It holds no queue and no crawl state, so it can be
 // used on its own as a "fetch this URL politely" library.
 type Fetcher interface {
@@ -138,7 +143,7 @@ func NewHTTPFetcher(cfg Config, opt Options) (*HTTPFetcher, error) {
 // refuses to dial private addresses unless explicitly allowed.
 func NewHTTPClient(cfg Config) *http.Client {
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -165,7 +170,11 @@ func NewHTTPClient(cfg Config) *http.Client {
 			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 				return fmt.Errorf("crawler: refusing to follow a redirect to %q", req.URL.Scheme)
 			}
-			if !cfg.AllowPrivateHosts && isPrivateHost(req.URL.Hostname()) {
+			if isPrivateHost(req.URL.Hostname()) {
+				prev := via[len(via)-1].URL
+				if cfg.AllowPrivateHosts && strings.EqualFold(req.URL.Host, prev.Host) {
+					return nil
+				}
 				return fmt.Errorf("crawler: refusing to follow a redirect to a private host")
 			}
 			return nil
@@ -188,18 +197,20 @@ func safeDialContext(dial func(context.Context, string, string) (net.Conn, error
 			}
 			return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 		}
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		ips, err := lookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, err
 		}
 		if len(ips) == 0 {
 			return nil, fmt.Errorf("crawler: no addresses for %q", host)
 		}
-		var lastErr error
 		for _, ipa := range ips {
 			if isPrivateIP(ipa.IP) {
 				return nil, fmt.Errorf("crawler: refusing to dial %s: %s is private or unroutable", addr, ipa.IP)
 			}
+		}
+		var lastErr error
+		for _, ipa := range ips {
 			target := net.JoinHostPort(ipa.IP.String(), port)
 			conn, dialErr := dial(ctx, network, target)
 			if dialErr == nil {

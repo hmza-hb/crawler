@@ -37,6 +37,9 @@ func isPrivateHost(host string) bool {
 // hostIP parses an IP host literal, including decimal integer encodings some
 // stacks accept as hostnames (e.g. http://2130706433/ for 127.0.0.1).
 func hostIP(host string) net.IP {
+	if i := strings.Index(host, "%"); i >= 0 {
+		host = host[:i]
+	}
 	h := strings.Trim(host, "[]")
 	if ip := net.ParseIP(h); ip != nil {
 		return ip
@@ -58,10 +61,20 @@ func isPrivateIP(ip net.IP) bool {
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
 	}
+	if ip.Equal(broadcastIPv4) {
+		return true
+	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() {
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
+	}
+	if ip.To4() == nil && nat64Prefix.Contains(ip) {
+		v16 := ip.To16()
+		if v16 != nil {
+			v4 := net.IPv4(v16[12], v16[13], v16[14], v16[15])
+			return isPrivateIP(v4)
+		}
 	}
 	// Carrier-grade NAT, benchmarking, documentation and reserved ranges are all
 	// places a lead-generation crawl has no business reaching.
@@ -72,6 +85,17 @@ func isPrivateIP(ip net.IP) bool {
 	}
 	return false
 }
+
+var (
+	broadcastIPv4 = net.IPv4(255, 255, 255, 255)
+	nat64Prefix   = func() *net.IPNet {
+		_, n, err := net.ParseCIDR("64:ff9b::/96")
+		if err != nil {
+			panic(err)
+		}
+		return n
+	}()
+)
 
 var unroutableCIDRs = func() []*net.IPNet {
 	cidrs := []string{
@@ -125,6 +149,9 @@ func NormalizeURL(u *url.URL) (string, error) {
 	if (u.Scheme == "http" && strings.HasSuffix(u.Host, ":80")) ||
 		(u.Scheme == "https" && strings.HasSuffix(u.Host, ":443")) {
 		u.Host = strings.TrimSuffix(strings.TrimSuffix(u.Host, ":80"), ":443")
+	}
+	if u.Hostname() == "" {
+		return "", errEmptyURL
 	}
 	u.Fragment = ""
 	u.RawFragment = ""
