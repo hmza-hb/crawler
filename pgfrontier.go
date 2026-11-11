@@ -3,7 +3,9 @@ package crawler
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,8 +16,9 @@ import (
 // can claim from the same queue, and a process that dies mid-fetch leaves a
 // lease that expires rather than a permanently stuck item.
 type PostgresFrontier struct {
-	pool *pgxpool.Pool
-	now  func() time.Time
+	pool         *pgxpool.Pool
+	now          func() time.Time
+	perHostDelay time.Duration
 }
 
 // NewPostgresFrontier wraps a pool.
@@ -23,15 +26,24 @@ func NewPostgresFrontier(pool *pgxpool.Pool) *PostgresFrontier {
 	return &PostgresFrontier{pool: pool, now: time.Now}
 }
 
+// SetPerHostDelay configures the shared Postgres politeness gate (distributed
+// instances). Zero disables the host_limits check.
+func (f *PostgresFrontier) SetPerHostDelay(d time.Duration) {
+	f.perHostDelay = d
+}
+
 // SetClock replaces the time source, for deterministic tests.
 func (f *PostgresFrontier) SetClock(now func() time.Time) { f.now = now }
 
+func politenessDomain(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return registrableDomain(u.Hostname())
+}
+
 // Enqueue implements Frontier.
-//
-// The dedupe gate is a single statement: a CTE inserts the run's key into
-// crawler_frontier_seen and queues the URL only if that insert was new. Doing it
-// as two statements would require deleting the queue row on a conflict, and that
-// delete would also remove a legitimately queued item for the same key.
 func (f *PostgresFrontier) Enqueue(ctx context.Context, items []Item) (int, error) {
 	if len(items) == 0 {
 		return 0, nil
@@ -39,6 +51,7 @@ func (f *PostgresFrontier) Enqueue(ctx context.Context, items []Item) (int, erro
 	batch := &pgx.Batch{}
 	now := f.now().UTC()
 	for _, it := range items {
+		domain := politenessDomain(it.URL)
 		batch.Queue(`
 			WITH seen AS (
 				INSERT INTO crawler_frontier_seen (run_id, dedupe_key, seen_at)
@@ -47,11 +60,11 @@ func (f *PostgresFrontier) Enqueue(ctx context.Context, items []Item) (int, erro
 				RETURNING 1
 			)
 			INSERT INTO crawler_frontier (
-				dedupe_key, url, depth, priority, source_hint, run_id, enqueued_at, ready_at
+				dedupe_key, url, depth, priority, source_hint, run_id, enqueued_at, ready_at, politeness_domain
 			)
-			SELECT $2, $4, $5, $6, $7, $1, $3, $3
+			SELECT $2, $4, $5, $6, $7, $1, $3, $3, $8
 			FROM seen`,
-			it.RunID, itemKey(it), now, it.URL, it.Depth, it.Priority, it.SourceHint)
+			it.RunID, itemKey(it), now, it.URL, it.Depth, it.Priority, it.SourceHint, domain)
 	}
 	br := f.pool.SendBatch(ctx, batch)
 	added := 0
@@ -85,10 +98,18 @@ func (f *PostgresFrontier) Claim(ctx context.Context, n int, lease time.Duration
 		return nil, nil
 	}
 	now := f.now().UTC()
+	if f.perHostDelay <= 0 {
+		return f.claimSimple(ctx, n, lease, now)
+	}
+	return f.claimWithHostLimits(ctx, n, lease, now)
+}
+
+func (f *PostgresFrontier) claimSimple(ctx context.Context, n int, lease time.Duration, now time.Time) ([]Item, error) {
 	rows, err := f.pool.Query(ctx, `
 		WITH claimable AS (
 			SELECT id FROM crawler_frontier
-			WHERE ready_at <= $1
+			WHERE state = 'pending'
+			  AND ready_at <= $1
 			  AND (leased_until IS NULL OR leased_until <= $1)
 			ORDER BY priority DESC, enqueued_at
 			LIMIT $2
@@ -103,8 +124,105 @@ func (f *PostgresFrontier) Claim(ctx context.Context, n int, lease time.Duration
 	if err != nil {
 		return nil, fmt.Errorf("crawler: claim: %w", err)
 	}
+	return scanClaimedSimple(rows, n)
+}
+
+func (f *PostgresFrontier) claimWithHostLimits(ctx context.Context, n int, lease time.Duration, now time.Time) ([]Item, error) {
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("crawler: claim tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		SELECT f.id, f.politeness_domain
+		FROM crawler_frontier f
+		LEFT JOIN host_limits hl ON hl.domain = f.politeness_domain AND f.politeness_domain <> ''
+		WHERE f.state = 'pending'
+		  AND f.ready_at <= $1
+		  AND (f.leased_until IS NULL OR f.leased_until <= $1)
+		  AND (
+		    f.politeness_domain = ''
+		    OR hl.next_allowed_at IS NULL
+		    OR hl.next_allowed_at <= $1
+		  )
+		ORDER BY f.politeness_domain, f.priority DESC, f.enqueued_at
+		FOR UPDATE OF f SKIP LOCKED`, now)
+	if err != nil {
+		return nil, fmt.Errorf("crawler: claim scan: %w", err)
+	}
 	defer rows.Close()
 
+	type pick struct {
+		id     int64
+		domain string
+	}
+	seenDomain := make(map[string]struct{})
+	ids := make([]int64, 0, n)
+	for rows.Next() {
+		var id int64
+		var domain string
+		if err := rows.Scan(&id, &domain); err != nil {
+			return nil, fmt.Errorf("crawler: claim row: %w", err)
+		}
+		if domain != "" {
+			if _, ok := seenDomain[domain]; ok {
+				continue
+			}
+			seenDomain[domain] = struct{}{}
+		}
+		ids = append(ids, id)
+		if len(ids) >= n {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	claimRows, err := tx.Query(ctx, `
+		UPDATE crawler_frontier f
+		SET leased_until = $2, attempts = f.attempts + 1
+		WHERE f.id = ANY($1)
+		RETURNING f.dedupe_key, f.url, f.depth, f.priority, f.source_hint, f.run_id,
+		          f.attempts, f.enqueued_at, f.politeness_domain`,
+		ids, now.Add(lease))
+	if err != nil {
+		return nil, fmt.Errorf("crawler: claim update: %w", err)
+	}
+	out, domains, err := scanClaimedWithDomains(claimRows, n)
+	if err != nil {
+		return nil, err
+	}
+
+	nextAllowed := now.Add(f.perHostDelay)
+	for _, domain := range domains {
+		if domain == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO host_limits (domain, next_allowed_at)
+			VALUES ($1, $2)
+			ON CONFLICT (domain) DO UPDATE
+			SET next_allowed_at = GREATEST(host_limits.next_allowed_at, EXCLUDED.next_allowed_at)`,
+			domain, nextAllowed); err != nil {
+			return nil, fmt.Errorf("crawler: host limit %q: %w", domain, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("crawler: claim commit: %w", err)
+	}
+	return out, nil
+}
+
+func scanClaimedSimple(rows pgx.Rows, n int) ([]Item, error) {
+	defer rows.Close()
 	out := make([]Item, 0, n)
 	for rows.Next() {
 		var (
@@ -121,26 +239,39 @@ func (f *PostgresFrontier) Claim(ctx context.Context, n int, lease time.Duration
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("crawler: read claim rows: %w", err)
 	}
-	// UPDATE ... RETURNING does not preserve the CTE's ORDER BY, so the priority
-	// order has to be restored here. A frontier that hands out work in arbitrary
-	// order is a frontier that spends a deep budget on a shallow page.
 	sortItems(out)
 	return out, nil
 }
 
-// sortItems orders highest priority first, then oldest first.
-func sortItems(items []Item) {
-	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].Priority != items[j].Priority {
-			return items[i].Priority > items[j].Priority
+func scanClaimedWithDomains(rows pgx.Rows, n int) ([]Item, []string, error) {
+	defer rows.Close()
+	out := make([]Item, 0, n)
+	domains := make([]string, 0, n)
+	for rows.Next() {
+		var (
+			it       Item
+			attempts int
+			domain   string
+		)
+		if err := rows.Scan(&it.Key, &it.URL, &it.Depth, &it.Priority, &it.SourceHint,
+			&it.RunID, &attempts, &it.EnqueuedAt, &domain); err != nil {
+			return nil, nil, fmt.Errorf("crawler: scan claim: %w", err)
 		}
-		return items[i].EnqueuedAt.Before(items[j].EnqueuedAt)
-	})
+		it.Attempts = attempts
+		out = append(out, it)
+		if domain != "" {
+			domains = append(domains, domain)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("crawler: read claim rows: %w", err)
+	}
+	sortItems(out)
+	return out, domains, nil
 }
 
 // Complete implements Frontier. A nil error deletes the item; an error backs it
-// off exponentially, and an item that keeps failing is dropped so a crawl is
-// not a queue with infinite patience.
+// off exponentially, and an item that keeps failing moves to state failed.
 func (f *PostgresFrontier) Complete(ctx context.Context, items []Item, err error) error {
 	if len(items) == 0 {
 		return nil
@@ -155,29 +286,44 @@ func (f *PostgresFrontier) Complete(ctx context.Context, items []Item, err error
 			}
 			continue
 		}
+		errText := err.Error()
+		if strings.Contains(errText, errRelease.Error()) {
+			errText = "released for retry"
+		}
 		if _, updErr := f.pool.Exec(ctx, `
 			UPDATE crawler_frontier
-			SET failures    = failures + 1,
+			SET failures     = failures + 1,
 			    leased_until = NULL,
-			    ready_at    = $3 + make_interval(secs => LEAST(300, (failures + 1) * 2))
+			    ready_at     = $3 + make_interval(secs => LEAST(300, (failures + 1) * 2)),
+			    last_error   = $4,
+			    state        = CASE WHEN failures + 1 >= 3 THEN 'failed' ELSE state END
 			WHERE run_id = $1 AND dedupe_key = $2`,
-			it.RunID, itemKey(it), now); updErr != nil {
+			it.RunID, itemKey(it), now, errText); updErr != nil {
 			return fmt.Errorf("crawler: release %s: %w", it.URL, updErr)
-		}
-		if _, delErr := f.pool.Exec(ctx, `
-			DELETE FROM crawler_frontier
-			WHERE run_id = $1 AND dedupe_key = $2 AND failures >= 3`,
-			it.RunID, itemKey(it)); delErr != nil {
-			return fmt.Errorf("crawler: drop %s: %w", it.URL, delErr)
 		}
 	}
 	return nil
 }
 
+// FailedCount returns frontier rows in terminal failed state.
+func (f *PostgresFrontier) FailedCount(ctx context.Context, runID string) (int, error) {
+	var n int
+	q := `SELECT count(*) FROM crawler_frontier WHERE state = 'failed'`
+	args := []any{}
+	if runID != "" {
+		q += ` AND run_id = $1`
+		args = append(args, runID)
+	}
+	if err := f.pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("crawler: failed count: %w", err)
+	}
+	return n, nil
+}
+
 // Depth implements Frontier.
 func (f *PostgresFrontier) Depth(ctx context.Context) (int, error) {
 	var n int
-	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM crawler_frontier`).Scan(&n); err != nil {
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM crawler_frontier WHERE state <> 'failed'`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("crawler: frontier depth: %w", err)
 	}
 	return n, nil
@@ -193,10 +339,10 @@ func (f *PostgresFrontier) Pending(ctx context.Context) (time.Duration, bool, er
 		nextReady   *time.Time
 	)
 	err := f.pool.QueryRow(ctx, `
-		SELECT count(*),
-		       count(*) FILTER (WHERE ready_at <= $1 AND (leased_until IS NULL OR leased_until <= $1)),
-		       count(*) FILTER (WHERE leased_until > $1),
-		       min(ready_at) FILTER (WHERE ready_at > $1 AND (leased_until IS NULL OR leased_until <= $1))
+		SELECT count(*) FILTER (WHERE state <> 'failed'),
+		       count(*) FILTER (WHERE state = 'pending' AND ready_at <= $1 AND (leased_until IS NULL OR leased_until <= $1)),
+		       count(*) FILTER (WHERE state = 'pending' AND leased_until > $1),
+		       min(ready_at) FILTER (WHERE state = 'pending' AND ready_at > $1 AND (leased_until IS NULL OR leased_until <= $1))
 		FROM crawler_frontier`, f.now().UTC(),
 	).Scan(&total, &ready, &leasedCount, &nextReady)
 	if err != nil {
@@ -206,7 +352,6 @@ func (f *PostgresFrontier) Pending(ctx context.Context) (time.Duration, bool, er
 	case total == 0:
 		return 0, false, nil
 	case ready > 0 || leasedCount > 0:
-		// Something is claimable now, or a worker holds it and will signal.
 		return 0, true, nil
 	case nextReady != nil:
 		return maxDuration(0, nextReady.Sub(f.now().UTC())), true, nil
@@ -226,6 +371,9 @@ func (f *PostgresFrontier) Reset(ctx context.Context, runID string) error {
 		if _, err := f.pool.Exec(ctx, `DELETE FROM crawler_frontier_seen`); err != nil {
 			return fmt.Errorf("crawler: reset seen keys: %w", err)
 		}
+		if _, err := f.pool.Exec(ctx, `DELETE FROM host_limits`); err != nil {
+			return fmt.Errorf("crawler: reset host limits: %w", err)
+		}
 		return nil
 	}
 	if _, err := f.pool.Exec(ctx, `DELETE FROM crawler_frontier WHERE run_id = $1`, runID); err != nil {
@@ -240,6 +388,16 @@ func (f *PostgresFrontier) Reset(ctx context.Context, runID string) error {
 // Close implements Frontier. It is a no-op: the pool belongs to the process, and
 // several frontiers can share it.
 func (f *PostgresFrontier) Close() {}
+
+// sortItems orders highest priority first, then oldest first.
+func sortItems(items []Item) {
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Priority != items[j].Priority {
+			return items[i].Priority > items[j].Priority
+		}
+		return items[i].EnqueuedAt.Before(items[j].EnqueuedAt)
+	})
+}
 
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
