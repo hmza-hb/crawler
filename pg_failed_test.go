@@ -20,20 +20,24 @@ func TestPostgresFrontierFailedState(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	now := time.Now().UTC()
+	frontier.SetClock(func() time.Time { return now })
+
 	it := crawler.Item{URL: "https://example.com/bad", Key: "bad", RunID: runID}
 	if _, err := frontier.Enqueue(ctx, []crawler.Item{it}); err != nil {
 		t.Fatal(err)
 	}
 
 	fail := errors.New("permanent upstream error")
-	for range 3 {
+	for i := 0; i < 3; i++ {
 		claimed, err := frontier.Claim(ctx, 1, time.Minute)
 		if err != nil || len(claimed) != 1 {
-			t.Fatalf("claim: %v n=%d", err, len(claimed))
+			t.Fatalf("claim %d: err=%v n=%d", i+1, err, len(claimed))
 		}
 		if err := frontier.Complete(ctx, claimed, fail); err != nil {
 			t.Fatal(err)
 		}
+		now = now.Add(10 * time.Minute)
 	}
 
 	n, err := frontier.FailedCount(ctx, runID)

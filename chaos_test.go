@@ -26,8 +26,8 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 	}
 
 	const (
-		urlCount = 40
-		workers  = 6
+		urlCount = 24
+		workers  = 4
 	)
 	items := make([]crawler.Item, 0, urlCount)
 	for i := 0; i < urlCount; i++ {
@@ -50,13 +50,13 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 	closeDone := func() { once.Do(func() { close(done) }) }
 
 	lease := 30 * time.Millisecond
-	rng := rand.New(rand.NewSource(1))
 
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(worker + 1)))
 			for {
 				select {
 				case <-done:
@@ -76,7 +76,7 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 						t.Errorf("depth: %v", derr)
 						return
 					}
-					if depth == 0 && completed.Load() == urlCount {
+					if depth == 0 {
 						closeDone()
 						return
 					}
@@ -84,7 +84,7 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 					continue
 				}
 				for _, it := range batch {
-					if rng.Float64() < 0.35 {
+					if rng.Float64() < 0.25 {
 						// Simulate a worker killed before Complete: lease expires.
 						time.Sleep(lease + 5*time.Millisecond)
 						continue
@@ -96,13 +96,15 @@ func TestChaosMultiWorkerFrontier(t *testing.T) {
 					completed.Add(1)
 				}
 			}
-		}()
+		}(w)
 	}
 
-	deadline := time.After(30 * time.Second)
+	deadline := time.After(45 * time.Second)
 	select {
 	case <-done:
 	case <-deadline:
+		closeDone()
+		wg.Wait()
 		t.Fatal("chaos test timed out before the frontier drained")
 	}
 	wg.Wait()

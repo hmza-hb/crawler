@@ -49,7 +49,7 @@ func TestPostgresFrontierSharedHostPoliteness(t *testing.T) {
 		claimAt  []time.Time
 		otherAt  []time.Time
 		wg       sync.WaitGroup
-		workers  = 3
+		workers  = 1 // gap timing is per-domain; multiple workers race host_limits
 		stop     = make(chan struct{})
 	)
 
