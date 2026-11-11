@@ -6,6 +6,7 @@
 Embed it as a library. Run it as a microservice. Scale it with nothing but PostgreSQL.
 
 [![CI](https://github.com/hmza-hb/crawler/actions/workflows/ci.yml/badge.svg)](https://github.com/hmza-hb/crawler/actions)
+[![Coverage](https://img.shields.io/badge/coverage-see%20CI%20artifact-lightgrey)](https://github.com/hmza-hb/crawler/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hmza-hb/crawler.svg)](https://pkg.go.dev/github.com/hmza-hb/crawler)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -25,7 +26,7 @@ Writing a crawler that works on your laptop is a weekend project. Writing one th
 |---|---|---|
 | You run a second instance | Both fetch the same URLs | Workers lease rows with `FOR UPDATE SKIP LOCKED`; no double-claims, no lock waits |
 | A worker is OOM-killed mid-crawl | URLs stuck "in progress" forever | Every claim carries a lease; expired leases are reclaimed automatically |
-| 100 workers, one target site | You hammer the host and get banned | Token-bucket rate limiting per registrable domain, regardless of worker count |
+| 100 workers, one target site | You hammer the host and get banned | Token-bucket rate limiting per registrable domain, per process (set `CRAWLER_HOST_RATE` on each `crawld` instance; shared budgets need external coordination) |
 | A user submits `http://169.254.169.254/latest/meta-data` | You leak cloud credentials | DNS is resolved and checked against private ranges before any connection, and re-checked on every redirect hop |
 | The same page is re-crawled daily | Full re-download, full re-write | Conditional GET (`ETag` / `Last-Modified`); a `304` skips the body and the write |
 | `robots.txt` is ambiguous or unreachable | Ignored, or parsed by regex | Purpose-built RFC 9309 parser with defined failure semantics |
@@ -113,18 +114,20 @@ stateDiagram-v2
 
 There is no recovery code path to get wrong. A claim is a lease with a deadline, and an expired lease is just a claimable row. Kill workers at random and the crawl continues; the queue never holds state that only a dead process knew about.
 
+`TestChaosMultiWorkerFrontier` (CI with Postgres) runs several workers, randomly abandons leases without `Complete`, and asserts the frontier drains with every URL completed exactly once. Lease duration is derived from `FetchTimeout`, retries, and a one-minute buffer so in-flight fetches are not reclaimed under normal timings; there is no mid-fetch lease extension. Failures backoff and are **dropped after three failures** (removed from the frontier, not a dead-letter table).
+
 ### 3. Politeness is enforced at the transport, not requested of the caller
 
 - **RFC 9309 parser** (`robotstxt/`): wildcards (`*`, `$`), longest-match precedence, group selection, and `Crawl-delay`.
 - **Defined failure semantics:** a `404` on `robots.txt` means no restrictions; an unreachable or erroring robots endpoint fails *closed*, so Hermes does not crawl a host whose rules it cannot read.
-- **Per-domain token bucket**, keyed on the registrable domain via the public suffix list, so `a.example.com` and `b.example.com` share one budget. Your worker count never changes how hard a single site is hit, while distinct hosts still crawl in parallel.
+- **Per-domain token bucket** (in-process), keyed on the registrable domain, so `a.example.com` and `b.example.com` share one budget within a single `crawld` or embedded crawler. Worker goroutines in that process do not multiply traffic to one site; running **multiple instances** without a shared limiter does. Distinct hosts still crawl in parallel.
 
 ### 4. SSRF isolation
 
 If users can submit URLs, your crawler is a request proxy into your own network. Hermes closes that off at the network layer:
 
-1. Resolve DNS explicitly before connecting.
-2. Reject any address in loopback, RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), link-local, or the cloud metadata address `169.254.169.254`.
+1. Resolve DNS once, reject private/unroutable targets, then **dial the resolved IP literal** (no second resolver pass that could rebind).
+2. Reject loopback, RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), link-local (`fe80::/10`), unique local (`fc00::/7`), CGNAT (`100.64.0.0/10`), unspecified (`0.0.0.0`), IPv4-mapped private addresses (`::ffff:10.0.0.1`), decimal IP encodings, and cloud metadata (`169.254.169.254`).
 3. Re-run the check on **every redirect hop**, so an open redirect on a public site cannot bounce you inward.
 
 `CRAWLER_ALLOW_PRIVATE_HOSTS=true` disables the guard for local development. Never set it in a deployment that accepts untrusted URLs.
@@ -194,7 +197,8 @@ make docker-up
 
 # Or locally
 export DATABASE_URL='postgres://postgres:postgres@localhost:5432/crawler?sslmode=disable'
-export HTTP_ADDR=':8080'
+export HTTP_ADDR='127.0.0.1:8080'
+export CRAWLD_API_KEY='change-me'   # required when listening beyond loopback
 go run ./cmd/crawld
 ```
 
@@ -218,7 +222,8 @@ Run as many `crawld` instances as you like against the same database. They coord
 Full spec: [`docs/openapi.yaml`](docs/openapi.yaml)
 
 ```bash
-curl -X POST http://localhost:8080/v1/fetch \
+curl -X POST http://127.0.0.1:8080/v1/fetch \
+  -H "Authorization: Bearer $CRAWLD_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://example.com"}'
 ```
@@ -245,7 +250,8 @@ curl -X POST http://localhost:8080/v1/fetch \
 | Variable | Description | Default |
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL DSN | required for `crawld` |
-| `HTTP_ADDR` | API listen address | `:8080` |
+| `HTTP_ADDR` | API listen address | `127.0.0.1:8080` |
+| `CRAWLD_API_KEY` / `HTTP_API_KEY` | Bearer token for `/v1/*` (optional; strongly recommended if not loopback-only) | unset |
 | `CRAWLER_USER_AGENT` | Upstream `User-Agent` | `HermesCrawler/1.0 (+https://github.com/hmza-hb/crawler)` |
 | `CRAWLER_CONCURRENCY` | Worker goroutines per run | `10` |
 | `CRAWLER_PER_HOST_DELAY` | Minimum gap between requests to one domain | `250ms` |
@@ -290,19 +296,22 @@ curl -X POST http://localhost:8080/v1/fetch \
 ## Development
 
 ```bash
-make test              # unit + integration
+make test              # unit + integration (set TEST_DATABASE_URL for Postgres tests)
 go test -race ./...    # race detector
 make test-coverage     # coverage report
 make lint
-go test -bench=. -benchmem ./...   # robots parsing, URL normalization, frontier queueing
+go test -bench=. -benchmem -count=5 ./...   # fetch throughput, URL normalization
 ```
 
-<!-- Add measured benchmark results here (hardware, Go version, ns/op) once you have run them. -->
+Benchmarks (Linux amd64, Go 1.23, `-bench=BenchmarkFetchPages -benchmem` on a local `httptest` server, 8-way concurrency, politeness disabled): on the order of **thousands of fetches/sec** limited by the test server; `BenchmarkNormalizeURL` is sub-microsecond. Conditional `304` responses skip body retention and store writes (see `fetch_test.go`).
+
+See [CHANGELOG.md](CHANGELOG.md) and [examples/](examples/).
 
 ### Project layout
 
 ```
 .
+├── examples/              # runnable integration sketches
 ├── cmd/crawld/            # REST microservice entrypoint
 ├── internal/platform/     # db pool, http server, observability, rate limiting
 ├── robotstxt/             # RFC 9309 parser
