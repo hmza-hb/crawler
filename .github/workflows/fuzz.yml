@@ -1,0 +1,23 @@
+name: Scheduled fuzz
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Fuzz NormalizeURL
+        run: go test -fuzz=FuzzNormalizeURL -fuzztime=30s ./...
+
+      - name: Fuzz robotstxt Parse
+        run: go test -fuzz=FuzzParse -fuzztime=30s ./robotstxt/...

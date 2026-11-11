@@ -20,7 +20,9 @@ jobs:
           cache: true
 
       - name: Run Code Analysis
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go build ./examples/...
 
   vuln:
     name: Vulnerability scan
